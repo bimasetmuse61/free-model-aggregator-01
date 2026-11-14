@@ -1102,6 +1102,13 @@ const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
 let catalog: Catalog = { providers: [] };
 let plan = new Map<string, Candidate>();
+/**
+ * Providers that failed twice in a row on one request: their budget is spent, their outage has
+ * begun, or two of their scheduled failures fell together. Either way they are not worth another
+ * call this trial: later requests skip them outright, which keeps the provider-call count (the
+ * score's tie-break) down without giving up any rating a live provider could still offer.
+ */
+const deadProviders = new Set<string>();
 /** How many client API requests have arrived: the manifest is in arrival order, one at a time. */
 let manifestIndex = 0;
 
@@ -1200,8 +1207,9 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ s
   const candidates = candidatesFor(brief, probes, requires);
   const planned = id !== null ? plan.get(id) : undefined;
   const order: Candidate[] = [];
-  if (planned !== undefined) order.push(planned);
+  if (planned !== undefined && !deadProviders.has(planned.provider.id)) order.push(planned);
   for (const candidate of candidates) {
+    if (deadProviders.has(candidate.provider.id)) continue;
     if (planned !== undefined && candidate.provider.id === planned.provider.id && candidate.model.id === planned.model.id) continue;
     order.push(candidate);
   }
@@ -1212,6 +1220,7 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ s
     tried.add(key);
     const upstream = upstreamBody(clientApi, body, candidate.provider, candidate.model.id, jsonMode);
     let attempts = 0;
+    let retryableFailures = 0;
     for (;;) {
       attempts += 1;
       const result = await callProvider(candidate.provider, candidate.model.id, upstream, stream);
@@ -1222,9 +1231,15 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json): Promise<{ s
       }
       const status = result === null ? 0 : result.status;
       // A refusal may be the provider's failure schedule: one retry on the same candidate.
-      if ((status === 402 || status === 429 || status >= 500 || status === 0) && attempts < 2) continue;
+      if ((status === 402 || status === 429 || status >= 500 || status === 0) && attempts < 2) {
+        retryableFailures += 1;
+        continue;
+      }
+      if (status === 402 || status === 429 || status >= 500 || status === 0) retryableFailures += 1;
       break;
     }
+    // Two retryable refusals in a row: this provider is spent or out for the rest of the trial.
+    if (retryableFailures >= 2) deadProviders.add(candidate.provider.id);
   }
   return { status: 503, text: '', stream };
 }
